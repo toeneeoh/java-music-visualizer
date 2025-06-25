@@ -1,5 +1,4 @@
 import javazoom.jl.decoder.Bitstream;
-import javazoom.jl.player.JavaSoundAudioDevice;
 import javazoom.jl.player.advanced.AdvancedPlayer;
 import javazoom.jl.player.advanced.PlaybackEvent;
 import javazoom.jl.player.advanced.PlaybackListener;
@@ -9,281 +8,278 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.util.function.Consumer;
 
+/**
+ * AudioPlayer is a unified audio playback handler supporting both WAV and MP3 files.
+ *
+ * Plays, pauses, resumes, seeks, and stops audio.
+ *
+ * MP3 playback is handled using JLayer (AdvancedPlayer), and WAV uses javax.sound.sampled.
+ */
 public class AudioPlayer {
     private enum Type { NONE, MP3, WAV }
 
     private Type currentType = Type.NONE;
-    private String currentPath = null;
-    private String fileName = null;
+    private String currentPath;
+    private String fileName;
     private Consumer<String> statusReporter;
 
-    // MP3-specific
+    public boolean isPaused = true;
+    public boolean isFinished = true;
+
+    // MP3
     private AdvancedPlayer mp3Player;
     private Thread mp3Thread;
     private int mp3PausedFrame = 0;
-    private boolean mp3Paused = false;
-    private boolean mp3Stopped = false;
-    private long mp3StartTimeMillis = 0; // time playback starts
-    private int mp3LastFrame = 0;
     private int mp3TotalFrames = 0;
     private final int MP3_FRAME_DURATION_MS = 26;
+    private long mp3StartTimeMillis = 0;
 
-    // WAV-specific
-    private Clip wavClip;
+    // WAV
+    private Thread wavThread;
     private long wavPausedPos = 0;
-    private boolean wavPaused = false;
-    private long wavLength = 0; // length of wav in microseconds
+    private long wavLength = 0;
+    private boolean wavStopped = false;
 
     public float getProgress() {
         return switch (currentType) {
-            case MP3 -> mp3TotalFrames > 0 && !mp3Stopped
-                ? Math.min(getCurrentFrame() / (float) mp3TotalFrames, 1f)
-                : 0f;
-            case WAV -> wavClip != null && wavClip.isOpen() && wavLength > 0
-                ? wavClip.getMicrosecondPosition() / (float) wavLength
-                : 0f;
+            case MP3 -> mp3TotalFrames > 0 ? Math.min(getCurrentFrame() / (float) mp3TotalFrames, 1f) : 0f;
+            case WAV -> wavLength > 0 ? wavPausedPos / (float) wavLength : 0f;
             default -> 0f;
         };
     }
 
     private int getCurrentFrame() {
-        if (mp3Paused) return mp3PausedFrame;
-        return mp3PausedFrame + (int)((System.currentTimeMillis() - mp3StartTimeMillis) / MP3_FRAME_DURATION_MS);
+        if (isPaused) return mp3PausedFrame;
+        return mp3PausedFrame + (int) ((System.currentTimeMillis() - mp3StartTimeMillis) / MP3_FRAME_DURATION_MS);
     }
 
-    public void play(String path, String name, Consumer<String> statusReporter) {
-        stop(); // stop current playback
-
-        this.statusReporter = statusReporter;
+    public void play(String path, String name, Consumer<String> reporter) {
+        stop();
+        this.statusReporter = reporter;
         this.currentPath = path;
         this.fileName = name;
+        this.isPaused = false;
+        this.isFinished = false;
 
         if (path.endsWith(".mp3")) {
             currentType = Type.MP3;
-            mp3TotalFrames = 0; // reset total frames
+            mp3PausedFrame = 0;
             playMp3();
         } else if (path.endsWith(".wav")) {
             currentType = Type.WAV;
+            wavPausedPos = 0;
             playWav(0);
         } else {
-            statusReporter.accept("Error: Unsupported file type.");
+            reporter.accept("Error: Unsupported file type.");
+            isPaused = true;
+            isFinished = true;
         }
     }
 
     public void pause() {
-        switch (currentType) {
-            case MP3 -> pauseMp3();
-            case WAV -> pauseWav();
-            default -> statusReporter.accept("Nothing is playing.");
+        if (currentType == Type.MP3 && mp3Player != null) {
+            mp3PausedFrame = getCurrentFrame();
+            mp3Player.close();
+            statusReporter.accept("Paused " + fileName);
+        } else if (currentType == Type.WAV) {
+            wavStopped = true;
+            statusReporter.accept("Paused " + fileName);
         }
+
+        isPaused = true;
     }
 
     public void resume() {
-        switch (currentType) {
-            case MP3 -> resumeMp3();
-            case WAV -> resumeWav();
-            default -> statusReporter.accept("Nothing is playing.");
+        if (isFinished) {
+            play(currentPath, fileName, statusReporter);
+        } else {
+            isPaused = false;
+            if (currentType == Type.MP3) {
+                playMp3();
+                statusReporter.accept("Resumed " + fileName);
+            } else if (currentType == Type.WAV) {
+                playWav(wavPausedPos);
+                statusReporter.accept("Resumed " + fileName);
+            }
         }
     }
 
     public void stop() {
-        switch (currentType) {
-            case MP3 -> stopMp3();
-            case WAV -> stopWav();
-            default -> {
-                if (statusReporter != null)
-                    statusReporter.accept("Nothing is playing.");
+        isPaused = true;
+        if (currentType == Type.MP3 && mp3Player != null) {
+            mp3Player.close();
+        } else if (currentType == Type.WAV) {
+            wavStopped = true;
+            if (wavThread != null && wavThread.isAlive()) {
+                try {
+                    wavThread.join();
+                } catch (InterruptedException ignored) {}
             }
         }
-        currentType = Type.NONE;
-        currentPath = null;
-        fileName = null;
+        resetState();
     }
 
-    // ========== MP3 HANDLING ==========
+    private void resetState() {
+        isPaused = true;
+        isFinished = true;
+        mp3PausedFrame = 0;
+        wavPausedPos = 0;
+    }
+
+    public void seek(float percent) {
+        if (isFinished) return;
+        switch (currentType) {
+            case MP3 -> {
+                if (mp3TotalFrames > 0) {
+                    mp3PausedFrame = (int)(mp3TotalFrames * percent);
+                    resume();
+                }
+            }
+            case WAV -> {
+                if (wavLength > 0) {
+                    wavPausedPos = (long)(wavLength * percent);
+                    resume();
+                }
+            }
+            default -> {}
+        }
+    }
 
     private void playMp3() {
-        mp3Paused = false;
-        mp3Stopped = false;
+        try {
+            if (mp3TotalFrames == 0)
+                mp3TotalFrames = estimateFrameCount(currentPath);
 
-        mp3Thread = new Thread(() -> {
-            try {
-                // Estimate total frame count first
-                if (mp3TotalFrames == 0)
-                    mp3TotalFrames = estimateFrameCount(currentPath);
-                System.out.println("total frames: " + mp3TotalFrames);
+            FileInputStream fis = new FileInputStream(currentPath);
+            mp3Player = new AdvancedPlayer(fis, new VisualizingAudioDevice());
 
-                FileInputStream fis = new FileInputStream(currentPath);
-                mp3Player = new AdvancedPlayer(fis, new JavaSoundAudioDevice());
-
-                mp3LastFrame = mp3PausedFrame;
-
+            mp3Thread = new Thread(() -> {
+                mp3StartTimeMillis = System.currentTimeMillis();
                 mp3Player.setPlayBackListener(new PlaybackListener() {
                     @Override
                     public void playbackFinished(PlaybackEvent evt) {
-                        if (!mp3Paused && !mp3Stopped) {
-                            mp3PausedFrame = 0;
+                        if (!isPaused) {
                             statusReporter.accept("Finished playing: " + fileName);
-                            mp3Stopped = true;
-                        } else if (mp3Paused) {
-                            mp3PausedFrame += evt.getFrame();
+                            resetState();
                         }
-                        mp3LastFrame += evt.getFrame();
                     }
                 });
 
-                statusReporter.accept("Now playing: " + fileName);
-                mp3StartTimeMillis = System.currentTimeMillis();
-                mp3Player.play(mp3PausedFrame, Integer.MAX_VALUE);
+                try {
+                    statusReporter.accept("Now playing: " + fileName);
+                    mp3Player.play(mp3PausedFrame, Integer.MAX_VALUE);
+                } catch (Exception e) {
+                    statusReporter.accept("Error: " + e.getMessage());
+                }
+            });
 
-            } catch (Exception e) {
-                e.printStackTrace();
-                String message = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
-                statusReporter.accept("Error: " + message);
-            }
-        });
-
-        mp3Thread.start();
+            mp3Thread.start();
+        } catch (Exception e) {
+            statusReporter.accept("Error: " + e.getMessage());
+        }
     }
 
-    // hacky way to get mp3 length
     private int estimateFrameCount(String filePath) {
-        FileInputStream fis = null;
-        Bitstream bs = null;
-
-        try {
-            fis = new FileInputStream(filePath);
-            bs = new Bitstream(fis);
-
+        try (FileInputStream fis = new FileInputStream(filePath)) {
+            Bitstream bs = new Bitstream(fis);
             int frames = 0;
             while (bs.readFrame() != null) {
                 frames++;
                 bs.closeFrame();
             }
             return frames;
-
         } catch (Exception e) {
             return 0;
-        } finally {
-            try {
-                if (bs != null) bs.close();
-            } catch (Exception ignored) {}
-
-            try {
-                if (fis != null) fis.close();
-            } catch (Exception ignored) {}
         }
     }
 
-    // main method for seek bar
-    public void seek(float percent) {
-        switch (currentType) {
-            case MP3 -> seekMp3(percent);
-            case WAV -> seekWav(percent);
-            default -> {
-                if (statusReporter != null)
-                    statusReporter.accept("Error: Nothing to seek.");
-            }
-        }
-    }
-
-    private void seekMp3(float percent) {
-        if (mp3TotalFrames == 0) return;
-
-        mp3PausedFrame = (int)(mp3TotalFrames * percent);
-        resume();
-    }
-
-    private void seekWav(float percent) {
-        if (wavClip == null || wavLength == 0) return;
-
-        long target = (long)(wavLength * percent);
-        wavPausedPos = target;
-        resume();
-    }
-
-    private void pauseMp3() {
-        if (mp3Player != null) {
-            mp3Paused = true;
-            mp3Player.close(); // triggers playbackFinished()
-            statusReporter.accept("Paused " + fileName);
-        }
-    }
-
-    private void resumeMp3() {
-        if (mp3Paused && currentPath != null) {
-            statusReporter.accept("Resumed " + fileName);
-            playMp3();
-        }
-    }
-
-    private void stopMp3() {
-        mp3Stopped = true;
-        mp3PausedFrame = 0;
-        if (mp3Player != null) {
-            mp3Player.close();
-        }
-    }
-
-    // ========== WAV HANDLING ==========
-
-    private void playWav(long time) {
+    private void playWav(long timeMicros) {
         try {
-            AudioInputStream stream = AudioSystem.getAudioInputStream(new File(currentPath));
-            wavClip = AudioSystem.getClip();
-            wavClip.open(stream);
-            wavLength = wavClip.getMicrosecondLength();
+            if (wavThread != null && wavThread.isAlive()) wavThread.join();
 
-            wavClip.addLineListener(event -> {
-                if (event.getType() == LineEvent.Type.STOP && !wavPaused) {
-                    statusReporter.accept("Finished playing: " + fileName);
-                    wavPaused = true; // technically paused if finished
-                    wavClip.close();
+            AudioInputStream originalStream = AudioSystem.getAudioInputStream(new File(currentPath));
+            AudioFormat baseFormat = originalStream.getFormat();
+            AudioFormat workingFormat = baseFormat;
+
+            if (workingFormat.getEncoding() != AudioFormat.Encoding.PCM_SIGNED) {
+                workingFormat = new AudioFormat(
+                    AudioFormat.Encoding.PCM_SIGNED,
+                    baseFormat.getSampleRate(),
+                    16,
+                    baseFormat.getChannels(),
+                    baseFormat.getChannels() * 2,
+                    baseFormat.getSampleRate(),
+                    false
+                );
+                originalStream = AudioSystem.getAudioInputStream(workingFormat, originalStream);
+            }
+
+            final AudioFormat finalFormat = workingFormat;
+            AudioInputStream audioStream = originalStream;
+            wavLength = (long)((audioStream.getFrameLength() * 1_000_000.0) / finalFormat.getFrameRate());
+            SourceDataLine line = AudioSystem.getSourceDataLine(finalFormat);
+            line.open(finalFormat);
+
+            wavStopped = false;
+            wavThread = new Thread(() -> {
+                try (audioStream) {
+                    byte[] buffer = new byte[2048];
+                    line.start();
+
+                    if (timeMicros > 0) {
+                        long skipBytes = (long)((timeMicros / 1_000_000.0) * finalFormat.getFrameRate() * finalFormat.getFrameSize());
+                        audioStream.skip(skipBytes);
+                    }
+
+                    int bytesRead;
+                    while (!wavStopped && !isPaused && (bytesRead = audioStream.read(buffer)) != -1) {
+                        line.write(buffer, 0, bytesRead);
+                        float[] samples = decodePCM(buffer, bytesRead, finalFormat);
+                        PCMBuffer.addSamples(samples);
+                        wavPausedPos += (long)((bytesRead / (float) finalFormat.getFrameSize()) / finalFormat.getFrameRate() * 1_000_000);
+                    }
+
+                    line.drain();
+                    line.stop();
+                    line.close();
+
+                    if (!isPaused && !wavStopped) {
+                        statusReporter.accept("Finished playing: " + fileName);
+                        resetState();
+                    }
+                } catch (Exception e) {
+                    statusReporter.accept("Error: " + e.getMessage());
                 }
             });
 
-            wavPaused = false;
-            wavPausedPos = time;
-            wavClip.setMicrosecondPosition(time);
-            wavClip.start();
-
+            wavThread.start();
             statusReporter.accept("Now playing: " + fileName);
-
         } catch (Exception e) {
-            e.printStackTrace();
-            String message = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
-            statusReporter.accept("Error: " + message);
+            statusReporter.accept("Error: " + e.getMessage());
         }
     }
 
-    private void pauseWav() {
-        if (wavClip != null && wavClip.isRunning()) {
-            wavPausedPos = wavClip.getMicrosecondPosition();
-            wavClip.stop();
-            wavPaused = true;
-            statusReporter.accept("Paused " + fileName);
+    /**
+     * Converts raw PCM byte data into a normalized float array of audio samples.
+     *
+     * Assumes 16-bit little-endian signed PCM format. Each 2-byte sample is decoded
+     * into a float in the range [-1.0, 1.0]
+     *
+     * @param data   the raw PCM byte array
+     * @param length the number of valid bytes to decode
+     * @param format the AudioFormat of the input data
+     * @return a float array of decoded samples in the range [-1.0, 1.0]
+     */
+    private float[] decodePCM(byte[] data, int length, AudioFormat format) {
+        int sampleCount = length / 2;
+        float[] samples = new float[sampleCount];
+        for (int i = 0; i < sampleCount; i++) {
+            int low = data[2 * i] & 0xFF;
+            int high = data[2 * i + 1];
+            int sample = (high << 8) | low;
+            if (sample > 32767) sample -= 65536;
+            samples[i] = sample / 32768f;
         }
-    }
-
-    private void resumeWav() {
-        if (wavClip != null && wavPaused) {
-            if (wavClip.isOpen()) {
-                wavClip.setMicrosecondPosition(wavPausedPos);
-                wavClip.start();
-            } else {
-                playWav(wavPausedPos);
-            }
-            wavPaused = false;
-            statusReporter.accept("Resumed " + fileName);
-        }
-    }
-
-    private void stopWav() {
-        wavPaused = false;
-        wavPausedPos = 0;
-        if (wavClip != null && wavClip.isRunning()) {
-            wavClip.stop();
-            wavClip.close();
-        }
+        return samples;
     }
 }

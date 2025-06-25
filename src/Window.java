@@ -1,8 +1,10 @@
 import java.awt.BorderLayout;
+import java.awt.FlowLayout;
 import java.awt.event.*;
 import java.io.*;
 import javax.swing.*;
 import javax.swing.filechooser.FileNameExtensionFilter;
+import java.awt.Dimension;
 
 public class Window {
     private boolean seeking = false;
@@ -24,20 +26,38 @@ public class Window {
         JMenu fileMenu = new JMenu("File");
 
         // upload button
-        JMenuItem uploadItem = new JMenuItem("Upload");
+        JMenuItem uploadItem = new JMenuItem("Open");
 
-        // center placeholder
-        frame.add(new VisualizerPanel(), BorderLayout.CENTER);
+        // visualizer
+        VisualizerPanel visualizerPanel = new VisualizerPanel();
+        frame.add(visualizerPanel, BorderLayout.CENTER);
 
-        // bottom panel
+        // control panel
+        JPanel controlPanel = new JPanel(new FlowLayout(FlowLayout.LEFT));
+
+        // play / pause button
+        ImageIcon pauseIcon = new ImageIcon("res/pause.png");
+        ImageIcon playIcon  = new ImageIcon("res/play.png");
+        JButton playPauseButton = new JButton(playIcon);
+        playPauseButton.setPreferredSize(new Dimension(30, 30));
+        playPauseButton.setFocusable(false);
+        controlPanel.add(playPauseButton);
+
+        playPauseButton.addActionListener(e -> {
+            if (audioPlayer.isPaused) {
+                audioPlayer.resume();
+            } else {
+                audioPlayer.pause();
+            }
+        });
+
+        // seek bar
+        JSlider seekBar = new JSlider(0, 100, 0);
+        controlPanel.add(seekBar);
 
         // bottom panel
         JPanel bottomPanel = new JPanel();
         bottomPanel.setLayout(new BorderLayout());
-
-        // seek bar
-        JSlider seekBar = new JSlider(0, 100, 0);
-        bottomPanel.add(seekBar, BorderLayout.NORTH);
 
         // song label
         JLabel songLabel = new JLabel("Now playing: Nothing");
@@ -47,7 +67,14 @@ public class Window {
         fileMenu.add(uploadItem);
         menuBar.add(fileMenu);
         frame.setJMenuBar(menuBar);
-        frame.add(bottomPanel, BorderLayout.SOUTH);
+
+        // south container holds both control panel and bottom panel vertically
+        JPanel southContainer = new JPanel();
+        southContainer.setLayout(new BoxLayout(southContainer, BoxLayout.Y_AXIS));
+        southContainer.add(controlPanel);
+        southContainer.add(bottomPanel);
+
+        frame.add(southContainer, BorderLayout.SOUTH);
 
         // make frame visible
         frame.setVisible(true);
@@ -73,11 +100,12 @@ public class Window {
 
         // user-initiated seeking
         seekBar.addChangeListener(e -> {
-            if (isSeekingInternally) return; // Ignore programmatic changes
+            if (isSeekingInternally) return;
+
             if (seekBar.getValueIsAdjusting()) {
                 if (!seeking) {
                     seeking = true;
-                    audioPlayer.pause(); // Pause only once at drag start
+                    audioPlayer.pause(); // pause only once at drag start
                 }
             } else {
                 float percent = seekBar.getValue() / 100f;
@@ -87,12 +115,20 @@ public class Window {
         });
 
         // timer
-        Timer progressTimer = new Timer(200, e -> {
-            if (!seeking) {
+        Timer progressTimer = new Timer(100, e -> {
+            if (!seeking && !audioPlayer.isPaused) {
                 float progress = audioPlayer.getProgress();
                 isSeekingInternally = true;
                 seekBar.setValue((int)(progress * 100));
                 isSeekingInternally = false;
+            }
+            // set play button icon based on audio player
+            playPauseButton.setIcon(audioPlayer.isPaused ? playIcon : pauseIcon);
+            if (audioPlayer.isFinished) {
+                isSeekingInternally = true;
+                seekBar.setValue(0);
+                isSeekingInternally = false;
+                playPauseButton.setIcon(playIcon);
             }
         });
         progressTimer.start();
