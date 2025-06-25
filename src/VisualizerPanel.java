@@ -3,6 +3,7 @@ import java.awt.Color;
 import java.awt.Graphics;
 import java.awt.Graphics2D;
 import java.awt.RenderingHints;
+import java.util.LinkedList;
 import java.util.Timer;
 import java.util.TimerTask;
 
@@ -16,7 +17,14 @@ import java.util.TimerTask;
 public class VisualizerPanel extends JPanel {
     private static final int FFT_SIZE = 1024;
     private static final int BANDS = 64;
+    private static final int FRAME_INTERVAL_MS = 16; // ~60 fps
+    private static final int VISUAL_DELAY_MS = 500;
+    private static final float SMOOTHING_FACTOR = 0.5f;
+    private static final float MIN_CLAMP = 0.02f;
+    private static final float MAX_CLAMP = 1.0f;
+
     private float[] magnitudes = new float[BANDS];
+    private final LinkedList<float[]> fftDelayQueue = new LinkedList<>();
 
     public VisualizerPanel() {
         Timer timer = new Timer();
@@ -30,28 +38,41 @@ public class VisualizerPanel extends JPanel {
 
                     float[] real = new float[FFT_SIZE];
                     float[] imag = new float[FFT_SIZE];
+                    System.arraycopy(window, 0, real, 0, FFT_SIZE);
 
-                    for (int i = 0; i < FFT_SIZE; i++) real[i] = window[i];
                     fft(real, imag);
 
+                    float[] bandMagnitudes = new float[BANDS];
                     for (int i = 0; i < BANDS; i++) {
                         float sum = 0f;
                         int start = i * (FFT_SIZE / 2) / BANDS;
                         int end = (i + 1) * (FFT_SIZE / 2) / BANDS;
                         for (int j = start; j < end; j++) {
-                            float mag = (float)Math.sqrt(real[j]*real[j] + imag[j]*imag[j]);
+                            float mag = (float) Math.sqrt(real[j] * real[j] + imag[j] * imag[j]);
                             sum += mag;
                         }
+                        float avg = sum / (end - start);
 
-                        float magnitude = sum / (end - start);
+                        // clamp magnitude
+                        avg = Math.max(MIN_CLAMP, Math.min(MAX_CLAMP, avg));
+                        bandMagnitudes[i] = avg;
+                    }
 
-                        // smooth the bar height using exponential moving average
-                        magnitudes[i] = magnitudes[i] * 0.85f + magnitude * 0.15f;
+                    // add to delay queue
+                    fftDelayQueue.addLast(bandMagnitudes);
+                    int maxQueueSize = VISUAL_DELAY_MS / FRAME_INTERVAL_MS;
+                    if (fftDelayQueue.size() > maxQueueSize) {
+                        float[] delayed = fftDelayQueue.removeFirst();
+                        for (int i = 0; i < BANDS; i++) {
+                            // smooth magnitude
+                            magnitudes[i] = magnitudes[i] * SMOOTHING_FACTOR + delayed[i] * (1f - SMOOTHING_FACTOR);
+                        }
                     }
                 }
+
                 repaint();
             }
-        }, 0, 16); // ~60 FPS
+        }, 0, FRAME_INTERVAL_MS);
     }
 
     @Override
@@ -69,7 +90,7 @@ public class VisualizerPanel extends JPanel {
 
         g2.setColor(Color.GREEN);
         for (int i = 0; i < BANDS; i++) {
-            int barHeight = Math.min((int)(magnitudes[i] * 100), height);
+            int barHeight = (int)(magnitudes[i] * height);
             g2.fillRect(i * barWidth, height - barHeight, barWidth - 2, barHeight);
         }
     }
