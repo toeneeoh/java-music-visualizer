@@ -1,8 +1,0 @@
-{
-    "java.project.sourcePaths": [
-        "src"
-    ],
-    "java.project.referencedLibraries": [
-        "lib\\jlayer-1.0.3.jar"
-    ]
-}
